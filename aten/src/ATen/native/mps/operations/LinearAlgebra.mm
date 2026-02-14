@@ -1421,6 +1421,54 @@ static void linalg_eigh_mps_impl(
     const Tensor& infos,
     bool upper,
     bool compute_eigenvectors) {
+  // Use the native Metal Jacobi kernel for real float32 symmetric matrices
+  // up to JACOBI_MAX_N x JACOBI_MAX_N.  Larger matrices and other dtypes
+  // fall back to a CPU round-trip.
+  const int64_t n = eigenvectors.size(-1);
+  if (eigenvectors.scalar_type() == kFloat && n <= static_cast<int64_t>(JACOBI_MAX_N)) {
+    const int64_t batch_size = eigenvectors.numel() / (n * n);
+    if (batch_size == 0 || n == 0) {
+      infos.zero_();
+      return;
+    }
+
+    // Separate read-only input from the write-only outputs to avoid aliasing.
+    auto A_in = eigenvectors.contiguous(); // input symmetric matrix
+    auto vecs_out = at::empty_like(eigenvectors);
+    auto vals_out = eigenvalues.contiguous();
+
+    EighParams params;
+    params.n = static_cast<uint32_t>(n);
+    params.upper = upper ? 1u : 0u;
+
+    MPSStream* stream = getCurrentMPSStream();
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> compute_encoder = stream->commandEncoder();
+        const char* kernel_name = upper ? "symeig_jacobi_upper" : "symeig_jacobi_lower";
+        auto pipeline_state = lib.getPipelineStateForFunc(kernel_name);
+        getMPSProfiler().beginProfileKernel(pipeline_state, "symeig_jacobi", {A_in});
+        [compute_encoder setComputePipelineState:pipeline_state];
+        mtl_setArgs(compute_encoder, A_in, vals_out, vecs_out, params);
+        // One threadgroup per batch element; threads collaborate on row updates.
+        NSUInteger tg_size = std::min(
+            pipeline_state.maxTotalThreadsPerThreadgroup,
+            static_cast<NSUInteger>(n));
+        [compute_encoder dispatchThreadgroups:MTLSizeMake(batch_size, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        getMPSProfiler().endProfileKernel(pipeline_state);
+      }
+    });
+
+    eigenvectors.copy_(vecs_out);
+    if (!eigenvalues.is_contiguous()) {
+      eigenvalues.copy_(vals_out);
+    }
+    infos.zero_();
+    return;
+  }
+
+  // CPU fallback for unsupported dtypes or large matrices.
   auto eigenvectors_cpu = eigenvectors.to(kCPU);
   auto eigenvalues_cpu = at::empty_like(eigenvalues, eigenvalues.options().device(kCPU));
   auto infos_cpu = at::zeros_like(infos, infos.options().device(kCPU));

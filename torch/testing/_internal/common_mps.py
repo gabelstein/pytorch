@@ -326,8 +326,6 @@ if torch.backends.mps.is_available():
             # "kthvalue": None,
             "lcm": None,
             "linalg.cond": None,
-            "linalg.eigh": None,
-            "linalg.eigvalsh": None,
             "linalg.ldl_factor": None,
             "linalg.ldl_factor_ex": None,
             "linalg.ldl_solve": None,

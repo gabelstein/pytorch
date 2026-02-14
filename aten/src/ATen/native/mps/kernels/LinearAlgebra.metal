@@ -1030,3 +1030,168 @@ REGISTER_UNPACK_PIVOTS(int, int);
 REGISTER_UNPACK_PIVOTS(int, long);
 REGISTER_UNPACK_PIVOTS(long, int);
 REGISTER_UNPACK_PIVOTS(long, long);
+
+// Jacobi eigendecomposition for real symmetric matrices.
+//
+// Uses the classical cyclic Jacobi algorithm with all threads in a threadgroup
+// collaborating on a single batch element. Supports matrices up to
+// JACOBI_MAX_N x JACOBI_MAX_N in float32 (fits in threadgroup memory).
+//
+// Outputs eigenvalues in ascending order and the corresponding eigenvectors
+// as columns of the output matrix, matching linalg_eigh conventions.
+template <bool upper>
+kernel void symeig_jacobi(
+    device const float* A_in [[buffer(0)]],
+    device float* eigenvalues [[buffer(1)]],
+    device float* eigenvectors [[buffer(2)]],
+    constant EighParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]]) {
+  const uint n = params.n;
+
+  threadgroup float A[JACOBI_MAX_N * JACOBI_MAX_N];
+  threadgroup float V[JACOBI_MAX_N * JACOBI_MAX_N];
+  threadgroup uint perm[JACOBI_MAX_N];
+
+  device const float* A_batch = A_in + bid * n * n;
+
+  // Load A into shared memory, symmetrizing from the requested triangle.
+  // V is initialized to the identity matrix.
+  for (uint i = tid; i < n * n; i += tptg) {
+    uint r = i / n;
+    uint c = i % n;
+    float val;
+    if (upper) {
+      val = (r <= c) ? A_batch[r * n + c] : A_batch[c * n + r];
+    } else {
+      val = (r >= c) ? A_batch[r * n + c] : A_batch[c * n + r];
+    }
+    A[i] = val;
+    V[i] = (r == c) ? 1.0f : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Cyclic Jacobi sweeps: iterate over all off-diagonal (p,q) pairs in order.
+  // Threads collaborate on applying each rotation across all rows.
+  const uint max_sweeps = 50;
+  for (uint sweep = 0; sweep < max_sweeps; sweep++) {
+    threadgroup float offdiag_sq[1];
+    if (tid == 0) {
+      float sum = 0.0f;
+      for (uint p = 0; p < n - 1; p++) {
+        for (uint q = p + 1; q < n; q++) {
+          float v = A[p * n + q];
+          sum += v * v;
+        }
+      }
+      offdiag_sq[0] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (offdiag_sq[0] < 1e-24f) {
+      break;
+    }
+
+    for (uint p = 0; p < n - 1; p++) {
+      for (uint q = p + 1; q < n; q++) {
+        float app = A[p * n + p];
+        float aqq = A[q * n + q];
+        float apq = A[p * n + q];
+
+        if (fabs(apq) < 1e-10f) {
+          continue;
+        }
+
+        float theta = (aqq - app) / (2.0f * apq);
+        float t = (theta >= 0.0f)
+            ? 1.0f / (theta + sqrt(1.0f + theta * theta))
+            : 1.0f / (theta - sqrt(1.0f + theta * theta));
+        float cos_val = rsqrt(1.0f + t * t);
+        float sin_val = t * cos_val;
+
+        // All threads update the off-diagonal rows of A.
+        for (uint r = tid; r < n; r += tptg) {
+          if (r == p || r == q) {
+            continue;
+          }
+          float arp = A[r * n + p];
+          float arq = A[r * n + q];
+          float new_arp = cos_val * arp - sin_val * arq;
+          float new_arq = sin_val * arp + cos_val * arq;
+          A[r * n + p] = new_arp;
+          A[p * n + r] = new_arp;
+          A[r * n + q] = new_arq;
+          A[q * n + r] = new_arq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Single thread updates the 2x2 pivot block.
+        if (tid == 0) {
+          A[p * n + p] = app - t * apq;
+          A[q * n + q] = aqq + t * apq;
+          A[p * n + q] = 0.0f;
+          A[q * n + p] = 0.0f;
+        }
+
+        // All threads rotate the eigenvector columns.
+        for (uint r = tid; r < n; r += tptg) {
+          float vrp = V[r * n + p];
+          float vrq = V[r * n + q];
+          V[r * n + p] = cos_val * vrp - sin_val * vrq;
+          V[r * n + q] = sin_val * vrp + cos_val * vrq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+  }
+
+  // Compute a sort permutation (ascending eigenvalues) via insertion sort.
+  if (tid == 0) {
+    for (uint i = 0; i < n; i++) {
+      perm[i] = i;
+    }
+    for (uint i = 1; i < n; i++) {
+      uint key_idx = perm[i];
+      float key_val = A[key_idx * n + key_idx];
+      int j = (int)i - 1;
+      while (j >= 0 && A[perm[j] * n + perm[j]] > key_val) {
+        perm[j + 1] = perm[j];
+        j--;
+      }
+      perm[j + 1] = key_idx;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  device float* eig_batch = eigenvalues + bid * n;
+  for (uint i = tid; i < n; i += tptg) {
+    eig_batch[i] = A[perm[i] * n + perm[i]];
+  }
+
+  device float* V_batch = eigenvectors + bid * n * n;
+  for (uint i = tid; i < n * n; i += tptg) {
+    uint r = i / n;
+    uint c = i % n;
+    V_batch[r * n + c] = V[r * n + perm[c]];
+  }
+}
+
+template [[host_name("symeig_jacobi_upper")]]
+kernel void symeig_jacobi<true>(
+    device const float* A_in [[buffer(0)]],
+    device float* eigenvalues [[buffer(1)]],
+    device float* eigenvectors [[buffer(2)]],
+    constant EighParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]]);
+
+template [[host_name("symeig_jacobi_lower")]]
+kernel void symeig_jacobi<false>(
+    device const float* A_in [[buffer(0)]],
+    device float* eigenvalues [[buffer(1)]],
+    device float* eigenvectors [[buffer(2)]],
+    constant EighParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]]);

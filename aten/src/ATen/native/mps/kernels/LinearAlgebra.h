@@ -21,3 +21,12 @@ struct UnpackPivotsParams {
   uint32_t pivots_batch_stride;
   uint32_t dim_size;
 };
+
+// Maximum matrix size supported by the native Jacobi EVD Metal kernel.
+// Larger matrices fall back to CPU.
+#define JACOBI_MAX_N 32
+
+struct EighParams {
+  uint32_t n;
+  uint32_t upper; // 1 = use upper triangle, 0 = use lower triangle
+};
