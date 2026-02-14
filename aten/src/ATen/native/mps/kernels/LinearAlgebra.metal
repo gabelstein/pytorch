@@ -1052,7 +1052,6 @@ kernel void symeig_jacobi(
 
   threadgroup float A[JACOBI_MAX_N * JACOBI_MAX_N];
   threadgroup float V[JACOBI_MAX_N * JACOBI_MAX_N];
-  threadgroup uint perm[JACOBI_MAX_N];
 
   device const float* A_batch = A_in + bid * n * n;
 
@@ -1074,24 +1073,10 @@ kernel void symeig_jacobi(
 
   // Cyclic Jacobi sweeps: iterate over all off-diagonal (p,q) pairs in order.
   // Threads collaborate on applying each rotation across all rows.
+  // Individual rotations are skipped when |A[p,q]| is small, so converged
+  // matrices are cheap even without an explicit off-diagonal norm check.
   const uint max_sweeps = 50;
   for (uint sweep = 0; sweep < max_sweeps; sweep++) {
-    threadgroup float offdiag_sq[1];
-    if (tid == 0) {
-      float sum = 0.0f;
-      for (uint p = 0; p < n - 1; p++) {
-        for (uint q = p + 1; q < n; q++) {
-          float v = A[p * n + q];
-          sum += v * v;
-        }
-      }
-      offdiag_sq[0] = sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (offdiag_sq[0] < 1e-24f) {
-      break;
-    }
-
     for (uint p = 0; p < n - 1; p++) {
       for (uint q = p + 1; q < n; q++) {
         float app = A[p * n + p];
@@ -1145,34 +1130,42 @@ kernel void symeig_jacobi(
     }
   }
 
-  // Compute a sort permutation (ascending eigenvalues) via insertion sort.
+  // Compact eigenvalues (diagonal of A) into A[0..n-1], then reuse A[n..2n-1]
+  // as the sort permutation.  This avoids a separate threadgroup allocation that
+  // would push memory past the 32KB limit at n=64.
+  for (uint i = tid; i < n; i += tptg) {
+    A[i] = A[i * n + i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Store permutation indices as float (integers 0..63 are exact in float32).
   if (tid == 0) {
     for (uint i = 0; i < n; i++) {
-      perm[i] = i;
+      A[n + i] = float(i);
     }
     for (uint i = 1; i < n; i++) {
-      uint key_idx = perm[i];
-      float key_val = A[key_idx * n + key_idx];
+      uint key_idx = uint(A[n + i]);
+      float key_val = A[key_idx];
       int j = (int)i - 1;
-      while (j >= 0 && A[perm[j] * n + perm[j]] > key_val) {
-        perm[j + 1] = perm[j];
+      while (j >= 0 && A[uint(A[n + j])] > key_val) {
+        A[n + j + 1] = A[n + j];
         j--;
       }
-      perm[j + 1] = key_idx;
+      A[n + j + 1] = float(key_idx);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   device float* eig_batch = eigenvalues + bid * n;
   for (uint i = tid; i < n; i += tptg) {
-    eig_batch[i] = A[perm[i] * n + perm[i]];
+    eig_batch[i] = A[uint(A[n + i])];
   }
 
   device float* V_batch = eigenvectors + bid * n * n;
   for (uint i = tid; i < n * n; i += tptg) {
     uint r = i / n;
     uint c = i % n;
-    V_batch[r * n + c] = V[r * n + perm[c]];
+    V_batch[r * n + c] = V[r * n + uint(A[n + c])];
   }
 }
 
