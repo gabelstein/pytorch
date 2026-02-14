@@ -23,8 +23,10 @@ struct UnpackPivotsParams {
 };
 
 // Maximum matrix size supported by the native Jacobi EVD Metal kernel.
+// The kernel stores two N×N float32 matrices (A and V) in threadgroup memory.
+// Apple Silicon supports 32KB threadgroup memory: 2 × 64² × 4 = 32768 bytes.
 // Larger matrices fall back to CPU.
-#define JACOBI_MAX_N 32
+#define JACOBI_MAX_N 64
 
 struct EighParams {
   uint32_t n;
